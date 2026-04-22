@@ -22,9 +22,7 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    KeyboardButton,
     Message,
-    ReplyKeyboardMarkup,
     User,
 )
 from dotenv import load_dotenv
@@ -46,9 +44,15 @@ BTN_TAG_ACTION = "Тегнуть событие"
 BTN_SHOW_ACTIONS = "Список событий"
 BTN_HELP = "Помощь"
 
+WELCOME_TEXT = (
+    "<b>Привет, я Aimaz bot.</b>\n\n"
+    "Я помогаю собирать общий список /all, создавать события и тегать подписчиков.\n"
+    "Выбери нужное действие кнопками ниже."
+)
+
 HELP_TEXT = (
-    "<b>Бот для тегов и событий</b>\n\n"
-    "Все основные действия доступны через кнопки под полем ввода.\n\n"
+    "<b>Помощь</b>\n\n"
+    "Все основные действия доступны через кнопки под сообщением бота.\n\n"
     "<b>Как работает /all</b>\n"
     f"1. Нажми <b>{BTN_ENROLL_ALL}</b>, чтобы добавить себя в общий список.\n"
     f"2. Нажми <b>{BTN_SHOW_ALL}</b>, чтобы посмотреть всех участников.\n"
@@ -273,6 +277,15 @@ def format_users_list(users: list[dict[str, Any]]) -> str:
     )
 
 
+def format_users_aliases(users: list[dict[str, Any]]) -> str:
+    lines = []
+    for index, user in enumerate(users, start=1):
+        username = user.get("username")
+        alias = escape(username) if username else escape(user["display_name"])
+        lines.append(f"{index}. {alias}")
+    return "\n".join(lines)
+
+
 def format_actions_list(actions: list[dict[str, Any]]) -> str:
     return "\n".join(
         f"{index}. <code>{escape(action['name'])}</code> - {action['users_count']} подпис."
@@ -280,17 +293,39 @@ def format_actions_list(actions: list[dict[str, Any]]) -> str:
     )
 
 
-def main_menu_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=BTN_ENROLL_ALL), KeyboardButton(text=BTN_UNENROLL_ALL)],
-            [KeyboardButton(text=BTN_SHOW_ALL), KeyboardButton(text=BTN_TAG_ALL)],
-            [KeyboardButton(text=BTN_GET_SOSAL), KeyboardButton(text=BTN_CREATE_ACTION)],
-            [KeyboardButton(text=BTN_ENROLL_ACTION), KeyboardButton(text=BTN_UNENROLL_ACTION)],
-            [KeyboardButton(text=BTN_TAG_ACTION), KeyboardButton(text=BTN_SHOW_ACTIONS)],
-            [KeyboardButton(text=BTN_HELP)],
-        ],
-        resize_keyboard=True,
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=BTN_ENROLL_ALL, callback_data="menu:enroll_all"),
+                InlineKeyboardButton(text=BTN_UNENROLL_ALL, callback_data="menu:unenroll_all"),
+            ],
+            [
+                InlineKeyboardButton(text=BTN_SHOW_ALL, callback_data="menu:show_all"),
+                InlineKeyboardButton(text=BTN_TAG_ALL, callback_data="menu:tag_all"),
+            ],
+            [
+                InlineKeyboardButton(text=BTN_GET_SOSAL, callback_data="menu:get_sosal"),
+                InlineKeyboardButton(text=BTN_CREATE_ACTION, callback_data="menu:create_action"),
+            ],
+            [
+                InlineKeyboardButton(text=BTN_ENROLL_ACTION, callback_data="menu:pick_enroll_action"),
+                InlineKeyboardButton(text=BTN_UNENROLL_ACTION, callback_data="menu:pick_unenroll_action"),
+            ],
+            [
+                InlineKeyboardButton(text=BTN_TAG_ACTION, callback_data="menu:pick_tag_action"),
+                InlineKeyboardButton(text=BTN_SHOW_ACTIONS, callback_data="menu:show_actions"),
+            ],
+            [InlineKeyboardButton(text=BTN_HELP, callback_data="menu:help")],
+        ]
+    )
+
+
+def help_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Назад", callback_data="menu:home")],
+        ]
     )
 
 
@@ -305,6 +340,7 @@ def build_actions_keyboard(actions: list[dict[str, Any]], mode: str) -> InlineKe
                 )
             ]
         )
+    rows.append([InlineKeyboardButton(text="Назад в меню", callback_data="menu:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -349,84 +385,136 @@ async def send_daily_sosal(message: Message) -> None:
 @router.message(CommandStart())
 async def start_handler(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer(HELP_TEXT, reply_markup=main_menu_keyboard())
+    await message.answer(WELCOME_TEXT, reply_markup=main_menu_keyboard())
 
 
 @router.message(Command("help"))
 async def help_handler(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer(HELP_TEXT, reply_markup=main_menu_keyboard())
+    await message.answer(HELP_TEXT, reply_markup=help_keyboard())
 
 
-@router.message(F.text == BTN_ENROLL_ALL)
-async def enroll_all_handler(message: Message, state: FSMContext) -> None:
+@router.callback_query(F.data.startswith("menu:"))
+async def menu_callback_handler(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    if not message.from_user:
-        await answer_with_menu(message, "Не удалось определить пользователя.")
+    if not callback.data or not callback.message:
         return
 
-    added = await storage.enroll_user(message.chat.id, message.from_user)
-    if added:
-        await answer_with_menu(message, "Ты добавлен в список /all.")
-    else:
-        await answer_with_menu(message, "Ты уже есть в списке /all.")
+    action = callback.data.split(":", maxsplit=1)[1]
+    message = callback.message
 
-
-@router.message(F.text == BTN_UNENROLL_ALL)
-async def unenroll_all_handler(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    if not message.from_user:
-        await answer_with_menu(message, "Не удалось определить пользователя.")
+    if action == "home":
+        await message.answer(WELCOME_TEXT, reply_markup=main_menu_keyboard())
+        await callback.answer()
         return
 
-    removed = await storage.unenroll_user(message.chat.id, message.from_user.id)
-    if removed:
-        await answer_with_menu(message, "Ты удален из списка /all.")
-    else:
-        await answer_with_menu(message, "Тебя и так не было в списке /all.")
-
-
-@router.message(F.text == BTN_SHOW_ALL)
-async def show_all_handler(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    users = await storage.get_enrolled_users(message.chat.id)
-    if not users:
-        await answer_with_menu(message, "Список /all пока пуст.")
+    if action == "help":
+        await message.answer(HELP_TEXT, reply_markup=help_keyboard())
+        await callback.answer()
         return
 
-    await answer_with_menu(message, "Участники /all:\n" + format_users_list(users))
+    if action == "enroll_all":
+        if not callback.from_user:
+            await callback.answer("Не удалось определить пользователя.", show_alert=True)
+            return
 
+        added = await storage.enroll_user(message.chat.id, callback.from_user)
+        text = "Ты добавлен в список /all." if added else "Ты уже есть в списке /all."
+        await message.answer(text, reply_markup=main_menu_keyboard())
+        await callback.answer()
+        return
 
-@router.message(F.text == BTN_TAG_ALL)
-async def tag_all_handler(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    users = await storage.get_enrolled_users(message.chat.id)
-    if not users:
-        await answer_with_menu(
-            message,
-            "Список /all пуст. Сначала кто-нибудь должен нажать кнопку "
-            f"<b>{BTN_ENROLL_ALL}</b>.",
+    if action == "unenroll_all":
+        if not callback.from_user:
+            await callback.answer("Не удалось определить пользователя.", show_alert=True)
+            return
+
+        removed = await storage.unenroll_user(message.chat.id, callback.from_user.id)
+        text = "Ты удален из списка /all." if removed else "Тебя и так не было в списке /all."
+        await message.answer(text, reply_markup=main_menu_keyboard())
+        await callback.answer()
+        return
+
+    if action == "show_all":
+        users = await storage.get_enrolled_users(message.chat.id)
+        text = "Список /all пока пуст." if not users else "Участники /all:\n" + format_users_aliases(users)
+        await message.answer(text, reply_markup=main_menu_keyboard())
+        await callback.answer()
+        return
+
+    if action == "tag_all":
+        users = await storage.get_enrolled_users(message.chat.id)
+        if not users:
+            await message.answer(
+                "Список /all пуст. Сначала кто-нибудь должен нажать кнопку "
+                f"<b>{BTN_ENROLL_ALL}</b>.",
+                reply_markup=main_menu_keyboard(),
+            )
+            await callback.answer()
+            return
+
+        await message.answer("Тегаю всех:\n" + format_users_list(users), reply_markup=main_menu_keyboard())
+        await callback.answer()
+        return
+
+    if action == "get_sosal":
+        await send_daily_sosal(message)
+        await callback.answer()
+        return
+
+    if action == "create_action":
+        await state.set_state(CreateActionForm.waiting_for_name)
+        await message.answer(
+            "Отправь название нового события отдельным сообщением.\n\n"
+            "Пример: <code>dota</code>\n"
+            "Разрешены только буквы, цифры, <code>_</code> и <code>-</code>.",
+            reply_markup=main_menu_keyboard(),
         )
+        await callback.answer()
         return
 
-    await answer_with_menu(message, "Тегаю всех:\n" + format_users_list(users))
+    if action == "pick_enroll_action":
+        await show_actions_picker(
+            message,
+            "enroll",
+            "Выбери событие, на которое хочешь подписаться:",
+        )
+        await callback.answer()
+        return
 
+    if action == "pick_unenroll_action":
+        await show_actions_picker(
+            message,
+            "unenroll",
+            "Выбери событие, от которого хочешь отписаться:",
+        )
+        await callback.answer()
+        return
 
-@router.message(F.text == BTN_GET_SOSAL)
-async def get_sosal_handler(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await send_daily_sosal(message)
+    if action == "pick_tag_action":
+        await show_actions_picker(
+            message,
+            "tag",
+            "Выбери событие, подписчиков которого нужно тегнуть:",
+        )
+        await callback.answer()
+        return
 
+    if action == "show_actions":
+        actions = await storage.list_actions(message.chat.id)
+        if not actions:
+            await message.answer("Событий пока нет.", reply_markup=main_menu_keyboard())
+            await callback.answer()
+            return
 
-@router.message(F.text == BTN_CREATE_ACTION)
-async def create_action_prompt_handler(message: Message, state: FSMContext) -> None:
-    await state.set_state(CreateActionForm.waiting_for_name)
-    await message.answer(
-        "Отправь название нового события отдельным сообщением.\n\n"
-        "Пример: <code>dota</code>\n"
-        "Разрешены только буквы, цифры, <code>_</code> и <code>-</code>.",
-        reply_markup=main_menu_keyboard(),
-    )
+        await message.answer(
+            "<b>Список событий</b>\n" + format_actions_list(actions),
+            reply_markup=build_actions_keyboard(actions, "show"),
+        )
+        await callback.answer()
+        return
+
+    await callback.answer("Неизвестное действие.", show_alert=True)
 
 
 @router.message(CreateActionForm.waiting_for_name)
@@ -453,56 +541,6 @@ async def create_action_submit_handler(message: Message, state: FSMContext) -> N
             message,
             f"Событие <code>{escape(action_name)}</code> уже существует.",
         )
-
-
-@router.message(F.text == BTN_ENROLL_ACTION)
-async def enroll_action_picker_handler(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await show_actions_picker(
-        message,
-        "enroll",
-        "Выбери событие, на которое хочешь подписаться:",
-    )
-
-
-@router.message(F.text == BTN_UNENROLL_ACTION)
-async def unenroll_action_picker_handler(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await show_actions_picker(
-        message,
-        "unenroll",
-        "Выбери событие, от которого хочешь отписаться:",
-    )
-
-
-@router.message(F.text == BTN_TAG_ACTION)
-async def tag_action_picker_handler(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await show_actions_picker(
-        message,
-        "tag",
-        "Выбери событие, подписчиков которого нужно тегнуть:",
-    )
-
-
-@router.message(F.text == BTN_SHOW_ACTIONS)
-async def show_actions_handler(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    actions = await storage.list_actions(message.chat.id)
-    if not actions:
-        await answer_with_menu(message, "Событий пока нет.")
-        return
-
-    await message.answer(
-        "<b>Список событий</b>\n" + format_actions_list(actions),
-        reply_markup=build_actions_keyboard(actions, "show"),
-    )
-
-
-@router.message(F.text == BTN_HELP)
-async def help_button_handler(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await message.answer(HELP_TEXT, reply_markup=main_menu_keyboard())
 
 
 @router.callback_query(F.data.startswith("action:"))
@@ -596,7 +634,7 @@ async def action_callback_handler(callback: CallbackQuery, state: FSMContext) ->
 async def fallback_handler(message: Message) -> None:
     await answer_with_menu(
         message,
-        "Используй кнопки под полем ввода. Если нужно, нажми <b>Помощь</b> для подробного описания.",
+        "Используй кнопки под сообщением бота. Если меню не видно, отправь <code>/start</code> или <code>/help</code>.",
     )
 
 
