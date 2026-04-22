@@ -630,14 +630,6 @@ async def action_callback_handler(callback: CallbackQuery, state: FSMContext) ->
     await callback.answer("Неизвестное действие.", show_alert=True)
 
 
-@router.message()
-async def fallback_handler(message: Message) -> None:
-    await answer_with_menu(
-        message,
-        "Используй кнопки под сообщением бота. Если меню не видно, отправь <code>/start</code> или <code>/help</code>.",
-    )
-
-
 async def set_bot_commands(bot: Bot) -> None:
     await bot.set_my_commands(
         [
