@@ -261,6 +261,14 @@ def get_today_key() -> str:
     return datetime.now().date().isoformat()
 
 
+def extract_command_arg(message: Message) -> str | None:
+    text = (message.text or "").strip()
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        return None
+    return parts[1].strip() or None
+
+
 def normalize_action_name(raw_name: str | None) -> str | None:
     if not raw_name:
         return None
@@ -350,6 +358,35 @@ async def answer_with_menu(message: Message, text: str) -> None:
     await send_temporary_message(message, text, reply_markup=main_menu_keyboard())
 
 
+async def edit_interactive_message(
+    message: Message,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    try:
+        await message.edit_text(text, reply_markup=reply_markup)
+    except Exception:
+        pass
+
+
+async def edit_message_by_id(
+    bot: Bot,
+    chat_id: int,
+    message_id: int,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=reply_markup,
+        )
+    except Exception:
+        pass
+
+
 async def delete_message_later(sent_message: Message) -> None:
     await asyncio.sleep(AUTO_DELETE_SECONDS)
     try:
@@ -373,14 +410,15 @@ async def send_temporary_message(
 async def show_actions_picker(message: Message, mode: str, title: str) -> None:
     actions = await storage.list_actions(message.chat.id)
     if not actions:
-        await answer_with_menu(
+        await edit_interactive_message(
             message,
             "Событий пока нет. Сначала создай событие через кнопку "
             f"<b>{BTN_CREATE_ACTION}</b>.",
+            reply_markup=main_menu_keyboard(),
         )
         return
 
-    await send_temporary_message(
+    await edit_interactive_message(
         message,
         title,
         reply_markup=build_actions_keyboard(actions, mode),
@@ -390,36 +428,105 @@ async def show_actions_picker(message: Message, mode: str, title: str) -> None:
 async def send_daily_sosal(message: Message) -> None:
     picked_user = await storage.pick_daily_sosal_once(message.chat.id, get_today_key())
     if not picked_user:
-        await answer_with_menu(
+        await edit_interactive_message(
             message,
             "Некого выбирать. Сначала добавьте людей в общий список через кнопку "
             f"<b>{BTN_ENROLL_ALL}</b>.",
+            reply_markup=main_menu_keyboard(),
         )
         return
 
     mention = build_mention(picked_user["user_id"], picked_user["display_name"])
     if picked_user["status"] == "already_used":
-        await answer_with_menu(message, f"Сегодняшний sosal уже выбран: {mention}")
+        await edit_interactive_message(
+            message,
+            f"Сегодняшний sosal уже выбран: {mention}",
+            reply_markup=main_menu_keyboard(),
+        )
         return
 
-    await answer_with_menu(message, f"Сегодня sosal: {mention}")
+    await edit_interactive_message(
+        message,
+        f"Сегодня sosal: {mention}",
+        reply_markup=main_menu_keyboard(),
+    )
 
 
 @router.message(CommandStart())
 async def start_handler(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await send_temporary_message(message, WELCOME_TEXT, reply_markup=main_menu_keyboard())
+    await send_temporary_message(
+        message,
+        WELCOME_TEXT,
+        reply_markup=main_menu_keyboard(),
+        auto_delete=False,
+    )
 
 
 @router.message(Command("help"))
 async def help_handler(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await send_temporary_message(message, HELP_TEXT, reply_markup=help_keyboard())
+    await send_temporary_message(
+        message,
+        HELP_TEXT,
+        reply_markup=help_keyboard(),
+        auto_delete=False,
+    )
+
+
+@router.message(Command("all"))
+async def all_command_handler(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    users = await storage.get_enrolled_users(message.chat.id)
+    if not users:
+        await send_temporary_message(
+            message,
+            "Список /all пуст. Сначала кто-нибудь должен нажать кнопку "
+            f"<b>{BTN_ENROLL_ALL}</b>.",
+        )
+        return
+
+    await send_temporary_message(
+        message,
+        "Тегаю всех:\n" + format_users_list(users),
+        auto_delete=False,
+    )
+
+
+@router.message(Command("action"))
+async def action_command_handler(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    action_name = normalize_action_name(extract_command_arg(message))
+    if not action_name:
+        await send_temporary_message(
+            message,
+            "Укажи событие в формате <code>/action dota</code>.",
+        )
+        return
+
+    users = await storage.get_action_users(message.chat.id, action_name)
+    if users is None:
+        await send_temporary_message(
+            message,
+            f"Событие <code>{escape(action_name)}</code> не найдено.",
+        )
+        return
+    if not users:
+        await send_temporary_message(
+            message,
+            f"На событие <code>{escape(action_name)}</code> пока никто не подписан.",
+        )
+        return
+
+    await send_temporary_message(
+        message,
+        f"Тегаю событие <code>{escape(action_name)}</code>:\n" + format_users_list(users),
+        auto_delete=False,
+    )
 
 
 @router.callback_query(F.data.startswith("menu:"))
 async def menu_callback_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
     if not callback.data or not callback.message:
         return
 
@@ -427,48 +534,54 @@ async def menu_callback_handler(callback: CallbackQuery, state: FSMContext) -> N
     message = callback.message
 
     if action == "home":
-        await send_temporary_message(message, WELCOME_TEXT, reply_markup=main_menu_keyboard())
+        await state.clear()
+        await edit_interactive_message(message, WELCOME_TEXT, reply_markup=main_menu_keyboard())
         await callback.answer()
         return
 
     if action == "help":
-        await send_temporary_message(message, HELP_TEXT, reply_markup=help_keyboard())
+        await state.clear()
+        await edit_interactive_message(message, HELP_TEXT, reply_markup=help_keyboard())
         await callback.answer()
         return
 
     if action == "enroll_all":
+        await state.clear()
         if not callback.from_user:
             await callback.answer("Не удалось определить пользователя.", show_alert=True)
             return
 
         added = await storage.enroll_user(message.chat.id, callback.from_user)
         text = "Ты добавлен в список /all." if added else "Ты уже есть в списке /all."
-        await send_temporary_message(message, text, reply_markup=main_menu_keyboard())
+        await edit_interactive_message(message, text, reply_markup=main_menu_keyboard())
         await callback.answer()
         return
 
     if action == "unenroll_all":
+        await state.clear()
         if not callback.from_user:
             await callback.answer("Не удалось определить пользователя.", show_alert=True)
             return
 
         removed = await storage.unenroll_user(message.chat.id, callback.from_user.id)
         text = "Ты удален из списка /all." if removed else "Тебя и так не было в списке /all."
-        await send_temporary_message(message, text, reply_markup=main_menu_keyboard())
+        await edit_interactive_message(message, text, reply_markup=main_menu_keyboard())
         await callback.answer()
         return
 
     if action == "show_all":
+        await state.clear()
         users = await storage.get_enrolled_users(message.chat.id)
         text = "Список /all пока пуст." if not users else "Участники /all:\n" + format_users_aliases(users)
-        await send_temporary_message(message, text, reply_markup=main_menu_keyboard())
+        await edit_interactive_message(message, text, reply_markup=main_menu_keyboard())
         await callback.answer()
         return
 
     if action == "tag_all":
+        await state.clear()
         users = await storage.get_enrolled_users(message.chat.id)
         if not users:
-            await send_temporary_message(
+            await edit_interactive_message(
                 message,
                 "Список /all пуст. Сначала кто-нибудь должен нажать кнопку "
                 f"<b>{BTN_ENROLL_ALL}</b>.",
@@ -480,20 +593,22 @@ async def menu_callback_handler(callback: CallbackQuery, state: FSMContext) -> N
         await send_temporary_message(
             message,
             "Тегаю всех:\n" + format_users_list(users),
-            reply_markup=main_menu_keyboard(),
             auto_delete=False,
         )
         await callback.answer()
         return
 
     if action == "get_sosal":
+        await state.clear()
         await send_daily_sosal(message)
         await callback.answer()
         return
 
     if action == "create_action":
+        await state.clear()
         await state.set_state(CreateActionForm.waiting_for_name)
-        await send_temporary_message(
+        await state.update_data(menu_message_id=message.message_id)
+        await edit_interactive_message(
             message,
             "Отправь название нового события отдельным сообщением.\n\n"
             "Пример: <code>dota</code>\n"
@@ -504,6 +619,7 @@ async def menu_callback_handler(callback: CallbackQuery, state: FSMContext) -> N
         return
 
     if action == "pick_enroll_action":
+        await state.clear()
         await show_actions_picker(
             message,
             "enroll",
@@ -513,6 +629,7 @@ async def menu_callback_handler(callback: CallbackQuery, state: FSMContext) -> N
         return
 
     if action == "pick_unenroll_action":
+        await state.clear()
         await show_actions_picker(
             message,
             "unenroll",
@@ -522,6 +639,7 @@ async def menu_callback_handler(callback: CallbackQuery, state: FSMContext) -> N
         return
 
     if action == "pick_tag_action":
+        await state.clear()
         await show_actions_picker(
             message,
             "tag",
@@ -531,13 +649,14 @@ async def menu_callback_handler(callback: CallbackQuery, state: FSMContext) -> N
         return
 
     if action == "show_actions":
+        await state.clear()
         actions = await storage.list_actions(message.chat.id)
         if not actions:
-            await send_temporary_message(message, "Событий пока нет.", reply_markup=main_menu_keyboard())
+            await edit_interactive_message(message, "Событий пока нет.", reply_markup=main_menu_keyboard())
             await callback.answer()
             return
 
-        await send_temporary_message(
+        await edit_interactive_message(
             message,
             "<b>Список событий</b>\n" + format_actions_list(actions),
             reply_markup=build_actions_keyboard(actions, "show"),
@@ -550,18 +669,39 @@ async def menu_callback_handler(callback: CallbackQuery, state: FSMContext) -> N
 
 @router.message(CreateActionForm.waiting_for_name)
 async def create_action_submit_handler(message: Message, state: FSMContext) -> None:
+    state_data = await state.get_data()
+    menu_message_id = state_data.get("menu_message_id")
     action_name = normalize_action_name(message.text)
     if not action_name:
-        await send_temporary_message(
-            message,
-            "Некорректное название события. Отправь название еще раз.\n"
-            "Пример: <code>dota</code> или <code>cs2_party</code>.",
-            reply_markup=main_menu_keyboard(),
-        )
+        if menu_message_id:
+            await edit_message_by_id(
+                message.bot,
+                message.chat.id,
+                menu_message_id,
+                "Некорректное название события. Отправь название еще раз.\n"
+                "Пример: <code>dota</code> или <code>cs2_party</code>.",
+                reply_markup=main_menu_keyboard(),
+            )
         return
 
     await state.clear()
     created = await storage.create_action(message.chat.id, action_name)
+    result_text = (
+        f"Событие <code>{escape(action_name)}</code> создано.\n"
+        f"Теперь на него можно подписываться через кнопку <b>{BTN_ENROLL_ACTION}</b>."
+        if created
+        else f"Событие <code>{escape(action_name)}</code> уже существует."
+    )
+    if menu_message_id:
+        await edit_message_by_id(
+            message.bot,
+            message.chat.id,
+            menu_message_id,
+            result_text,
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
     if created:
         await answer_with_menu(
             message,
@@ -593,7 +733,7 @@ async def action_callback_handler(callback: CallbackQuery, state: FSMContext) ->
             await callback.answer("Событие не найдено.", show_alert=True)
             return
         if not users:
-            await send_temporary_message(
+            await edit_interactive_message(
                 callback.message,
                 f"На событие <code>{escape(action_name)}</code> пока никто не подписан.",
                 reply_markup=main_menu_keyboard(),
@@ -601,7 +741,7 @@ async def action_callback_handler(callback: CallbackQuery, state: FSMContext) ->
             await callback.answer()
             return
 
-        await send_temporary_message(
+        await edit_interactive_message(
             callback.message,
             f"Подписчики события <code>{escape(action_name)}</code>:\n" + format_users_list(users),
             reply_markup=main_menu_keyboard(),
@@ -621,7 +761,7 @@ async def action_callback_handler(callback: CallbackQuery, state: FSMContext) ->
             text = f"Ты уже подписан на событие <code>{escape(action_name)}</code>."
         else:
             text = f"Ты подписан на событие <code>{escape(action_name)}</code>."
-        await send_temporary_message(callback.message, text, reply_markup=main_menu_keyboard())
+        await edit_interactive_message(callback.message, text, reply_markup=main_menu_keyboard())
         await callback.answer()
         return
 
@@ -637,7 +777,7 @@ async def action_callback_handler(callback: CallbackQuery, state: FSMContext) ->
             text = f"Ты не подписан на событие <code>{escape(action_name)}</code>."
         else:
             text = f"Ты отписан от события <code>{escape(action_name)}</code>."
-        await send_temporary_message(callback.message, text, reply_markup=main_menu_keyboard())
+        await edit_interactive_message(callback.message, text, reply_markup=main_menu_keyboard())
         await callback.answer()
         return
 
@@ -647,7 +787,7 @@ async def action_callback_handler(callback: CallbackQuery, state: FSMContext) ->
             await callback.answer("Событие не найдено.", show_alert=True)
             return
         if not users:
-            await send_temporary_message(
+            await edit_interactive_message(
                 callback.message,
                 f"На событие <code>{escape(action_name)}</code> пока никто не подписан.",
                 reply_markup=main_menu_keyboard(),
@@ -658,7 +798,6 @@ async def action_callback_handler(callback: CallbackQuery, state: FSMContext) ->
         await send_temporary_message(
             callback.message,
             f"Тегаю событие <code>{escape(action_name)}</code>:\n" + format_users_list(users),
-            reply_markup=main_menu_keyboard(),
             auto_delete=False,
         )
         await callback.answer()
@@ -672,6 +811,8 @@ async def set_bot_commands(bot: Bot) -> None:
         [
             BotCommand(command="start", description="Показать меню с кнопками"),
             BotCommand(command="help", description="Подробное описание кнопок"),
+            BotCommand(command="all", description="Тегнуть всех из общего списка"),
+            BotCommand(command="action", description="Тегнуть подписчиков события"),
         ]
     )
 
