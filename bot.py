@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import random
 import re
+import time
 from datetime import datetime
 from html import escape
 from pathlib import Path
@@ -31,6 +33,7 @@ from dotenv import load_dotenv
 DATA_FILE = Path("bot_data.json")
 ACTION_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 AUTO_DELETE_SECONDS = 5
+TAG_COOLDOWN_SECONDS = 60
 router = Router()
 
 BTN_ENROLL_ALL = "Записаться в /all"
@@ -108,6 +111,7 @@ class BotStorage:
                 "enrolled_users": {},
                 "daily_sosal": {},
                 "actions": {},
+                "tag_cooldowns": {},
             },
         )
 
@@ -249,12 +253,35 @@ class BotStorage:
 
             return sorted(result, key=lambda item: item["name"])
 
+    async def check_and_mark_tag_cooldown(self, chat_id: int, cooldown_key: str) -> int:
+        async with self.lock:
+            chat_bucket = self._get_chat_bucket(chat_id)
+            tag_cooldowns = chat_bucket.setdefault("tag_cooldowns", {})
+            now = time.time()
+            last_used_at = float(tag_cooldowns.get(cooldown_key, 0))
+            remaining = math.ceil(last_used_at + TAG_COOLDOWN_SECONDS - now)
+
+            if remaining > 0:
+                return remaining
+
+            tag_cooldowns[cooldown_key] = now
+            self._save()
+            return 0
+
 
 storage = BotStorage(DATA_FILE)
 
 
 def build_mention(user_id: int, display_name: str) -> str:
     return f'<a href="tg://user?id={user_id}">{escape(display_name)}</a>'
+
+
+def format_actor(user: User) -> str:
+    if user.username:
+        return escape(user.username.lstrip("@"))
+    if user.full_name:
+        return escape(user.full_name)
+    return f"user_{user.id}"
 
 
 def get_today_key() -> str:
@@ -477,6 +504,10 @@ async def help_handler(message: Message, state: FSMContext) -> None:
 @router.message(Command("all"))
 async def all_command_handler(message: Message, state: FSMContext) -> None:
     await state.clear()
+    if not message.from_user:
+        await send_temporary_message(message, "Не удалось определить пользователя.")
+        return
+
     users = await storage.get_enrolled_users(message.chat.id)
     if not users:
         await send_temporary_message(
@@ -486,9 +517,17 @@ async def all_command_handler(message: Message, state: FSMContext) -> None:
         )
         return
 
+    remaining = await storage.check_and_mark_tag_cooldown(message.chat.id, "all")
+    if remaining:
+        await send_temporary_message(
+            message,
+            f"/all можно тегать раз в минуту. Подожди еще {remaining} сек.",
+        )
+        return
+
     await send_temporary_message(
         message,
-        "Тегаю всех:\n" + format_users_list(users),
+        f"Тегает: {format_actor(message.from_user)}\n\n" + format_users_list(users),
         auto_delete=False,
     )
 
@@ -496,6 +535,10 @@ async def all_command_handler(message: Message, state: FSMContext) -> None:
 @router.message(Command("action"))
 async def action_command_handler(message: Message, state: FSMContext) -> None:
     await state.clear()
+    if not message.from_user:
+        await send_temporary_message(message, "Не удалось определить пользователя.")
+        return
+
     action_name = normalize_action_name(extract_command_arg(message))
     if not action_name:
         await send_temporary_message(
@@ -518,9 +561,20 @@ async def action_command_handler(message: Message, state: FSMContext) -> None:
         )
         return
 
+    remaining = await storage.check_and_mark_tag_cooldown(message.chat.id, f"action:{action_name}")
+    if remaining:
+        await send_temporary_message(
+            message,
+            f"Событие <code>{escape(action_name)}</code> можно тегать раз в минуту. "
+            f"Подожди еще {remaining} сек.",
+        )
+        return
+
     await send_temporary_message(
         message,
-        f"Тегаю событие <code>{escape(action_name)}</code>:\n" + format_users_list(users),
+        f"Тегает: {format_actor(message.from_user)}\n"
+        f"Событие: <code>{escape(action_name)}</code>\n\n"
+        + format_users_list(users),
         auto_delete=False,
     )
 
@@ -579,6 +633,10 @@ async def menu_callback_handler(callback: CallbackQuery, state: FSMContext) -> N
 
     if action == "tag_all":
         await state.clear()
+        if not callback.from_user:
+            await callback.answer("Не удалось определить пользователя.", show_alert=True)
+            return
+
         users = await storage.get_enrolled_users(message.chat.id)
         if not users:
             await edit_interactive_message(
@@ -590,9 +648,19 @@ async def menu_callback_handler(callback: CallbackQuery, state: FSMContext) -> N
             await callback.answer()
             return
 
+        remaining = await storage.check_and_mark_tag_cooldown(message.chat.id, "all")
+        if remaining:
+            await edit_interactive_message(
+                message,
+                f"/all можно тегать раз в минуту. Подожди еще {remaining} сек.",
+                reply_markup=main_menu_keyboard(),
+            )
+            await callback.answer()
+            return
+
         await send_temporary_message(
             message,
-            "Тегаю всех:\n" + format_users_list(users),
+            f"Тегает: {format_actor(callback.from_user)}\n\n" + format_users_list(users),
             auto_delete=False,
         )
         await callback.answer()
@@ -795,9 +863,25 @@ async def action_callback_handler(callback: CallbackQuery, state: FSMContext) ->
             await callback.answer()
             return
 
+        remaining = await storage.check_and_mark_tag_cooldown(
+            callback.message.chat.id,
+            f"action:{action_name}",
+        )
+        if remaining:
+            await edit_interactive_message(
+                callback.message,
+                f"Событие <code>{escape(action_name)}</code> можно тегать раз в минуту. "
+                f"Подожди еще {remaining} сек.",
+                reply_markup=main_menu_keyboard(),
+            )
+            await callback.answer()
+            return
+
         await send_temporary_message(
             callback.message,
-            f"Тегаю событие <code>{escape(action_name)}</code>:\n" + format_users_list(users),
+            f"Тегает: {format_actor(callback.from_user)}\n"
+            f"Событие: <code>{escape(action_name)}</code>\n\n"
+            + format_users_list(users),
             auto_delete=False,
         )
         await callback.answer()
